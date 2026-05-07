@@ -136,6 +136,8 @@ autoinstall:
     # =========================================================================
     - 'echo "===== PHASE 4/7 : Boot graphique + auto-login ====="'
     - curtin in-target -- systemctl set-default graphical.target
+    - curtin in-target -- sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub
+    - curtin in-target -- update-grub
     - |
       curtin in-target -- bash -c 'mkdir -p /etc/lightdm/lightdm.conf.d && cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<EOF
       [Seat:*]
@@ -397,6 +399,24 @@ autoinstall:
         </property>
       </channel>
       EOF'
+    # xfce4-panel : aucun panneau (évite la barre visible avant Chromium)
+    - |
+      cat > /target/home/kiosk/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml << 'PANEL_EOF'
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-panel" version="1.0">
+        <property name="panels" type="array">
+        </property>
+      </channel>
+      PANEL_EOF
+
+    # .xprofile : fond noir immédiat avant le démarrage de XFCE
+    - |
+      cat > /target/home/kiosk/.xprofile << 'XPROFILE_EOF'
+      #!/bin/bash
+      xsetroot -solid black
+      XPROFILE_EOF
+      chmod +x /target/home/kiosk/.xprofile
+
     # chown déplacé dans kiosk-firstboot.sh (utilisateur kiosk pas encore créé)
 
     # =========================================================================
