@@ -1,0 +1,14 @@
+# ISOs (sources et générées)
+*.iso
+
+# Dossiers de build
+iso-build/
+BOOT/
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*~
+
+# Hash de mot de passe en local (si tu veux séparer)
+user-data.local

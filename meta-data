@@ -1,0 +1,3 @@
+# Fichier meta-data requis par cloud-init (peut rester vide)
+instance-id: ubuntu-terminal-applicatif
+local-hostname: terminal-01

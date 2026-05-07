@@ -1,0 +1,438 @@
+#cloud-config
+# =============================================================================
+# Ubuntu Server 24.04 — Terminal applicatif (XFCE + Chromium kiosque)
+# =============================================================================
+# Génère le hash du mot de passe avec : mkpasswd -m sha-512
+# (paquet : sudo apt install whois)
+# =============================================================================
+
+autoinstall:
+  version: 1
+
+  # ---------- Locale et clavier ----------
+  locale: fr_FR.UTF-8
+  keyboard:
+    layout: fr
+    variant: ""
+
+  # ---------- Miroir apt français (gain 2-3x sur le téléchargement) ----------
+  apt:
+    geoip: false
+    preserve_sources_list: false
+    primary:
+      - arches: [default]
+        uri: http://fr.archive.ubuntu.com/ubuntu
+
+  # ---------- Réseau (DHCP sur toute interface ethernet) ----------
+  network:
+    version: 2
+    ethernets:
+      any:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  # ---------- Identité ----------
+  identity:
+    hostname: terminal-01
+    realname: Kiosk User
+    username: kiosk
+    # ⚠️ REMPLACE PAR TON HASH (mkpasswd -m sha-512)
+    password: "$6$2HEQIdnxWVXIiRJW$H90ME4TJHHb4mmdCFHe31iFH6q9FO2DQic0DKRqm5tmlDxXxk9GGNpzngQZdrle6uepUZYSyfhYOFMw3axjx9."
+
+  # ---------- SSH (admin distant) ----------
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # ---------- Disque (efface tout, partitionnement automatique) ----------
+  storage:
+    layout:
+      name: direct
+
+  # ---------- Pré-traitement du disque (avant Subiquity) ----------
+  early-commands:
+    - |
+      for dev in /dev/sda /dev/vda /dev/nvme0n1; do
+        if [ -b "$dev" ]; then
+          echo "Wiping $dev..."
+          wipefs -a "$dev" || true
+          sgdisk --zap-all "$dev" || true
+          dd if=/dev/zero of="$dev" bs=1M count=10 conv=fsync || true
+        fi
+      done
+      sync
+      partprobe || true
+
+  # ---------- Paquets installés pendant l'install ----------
+  # eatmydata : intercepte fsync() pour accélérer apt (gain 30-50% en VM)
+  packages:
+    - eatmydata
+    - openssh-server
+    - curl
+    - wget
+    - vim
+    - git
+    - htop
+    - unattended-upgrades
+    - unclutter
+    - xdotool
+    - x11-xserver-utils
+
+  # ---------- Mises à jour ----------
+  # Subiquity n'accepte que 'security' ou 'all' (pas 'none').
+  # Les MAJ de sécurité tournent pendant l'install — c'est le défaut sûr.
+  # Les optimisations principales (eatmydata, miroir FR, apt parallèle)
+  # compensent largement le temps des updates de sécurité.
+  updates: security
+
+  # ---------- Configuration post-install ----------
+  late-commands:
+    # =========================================================================
+    # PHASE 1/7 : Optimisation apt (parallélisation, retries)
+    # =========================================================================
+    - 'echo "===== PHASE 1/7 : Configuration apt ====="'
+    - |
+      curtin in-target -- bash -c 'cat > /etc/apt/apt.conf.d/99-kiosk-speedup <<EOF
+      Acquire::Queue-Mode "access";
+      Acquire::http::Pipeline-Depth "10";
+      Acquire::Languages "none";
+      APT::Acquire::Retries "3";
+      Dpkg::Use-Pty "0";
+      EOF'
+
+    # =========================================================================
+    # PHASE 2/7 : Activation univers + apt update (~30s)
+    # =========================================================================
+    - 'echo "===== PHASE 2/7 : Activation universe + apt update ====="'
+    - |
+      curtin in-target -- bash -c '
+        add-apt-repository universe -y
+        for i in 1 2 3; do
+          apt-get update && break
+          echo "apt-get update échoué (tentative $i/3), retry dans 10s..."
+          sleep 10
+        done
+      '
+
+    # =========================================================================
+    # PHASE 3/7 : Installation XFCE + LightDM (~3-5 min, ~600 MB)
+    # Fusion en une seule commande apt (gain ~20%) + eatmydata (gain 30-50%)
+    # =========================================================================
+    - 'echo "===== PHASE 3/7 : Installation XFCE + LightDM (3-5 min) ====="'
+    - |
+      curtin in-target -- bash -c '
+        DEBIAN_FRONTEND=noninteractive eatmydata apt-get install -y --show-progress \
+          xubuntu-core \
+          lightdm \
+          lightdm-gtk-greeter
+        # Supprime light-locker : responsable du retour au login après veille
+        DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y \
+          light-locker xfce4-screensaver 2>/dev/null || true
+      '
+
+    # =========================================================================
+    # PHASE 4/7 : Configuration boot graphique + auto-login
+    # =========================================================================
+    - 'echo "===== PHASE 4/7 : Boot graphique + auto-login ====="'
+    - curtin in-target -- systemctl set-default graphical.target
+    - |
+      curtin in-target -- bash -c 'mkdir -p /etc/lightdm/lightdm.conf.d && cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf <<EOF
+      [Seat:*]
+      autologin-user=kiosk
+      autologin-user-timeout=0
+      user-session=xubuntu
+      EOF'
+
+    # =========================================================================
+    # PHASE 5/7 : Policies Chromium + autostart
+    # =========================================================================
+    - 'echo "===== PHASE 5/7 : Policies Chromium + autostart ====="'
+    - curtin in-target -- mkdir -p /home/kiosk/.config/autostart
+    - |
+      curtin in-target -- bash -c 'cat > /home/kiosk/.config/autostart/kiosk.desktop <<EOF
+      [Desktop Entry]
+      Type=Application
+      Name=Kiosk App
+      Exec=/usr/local/bin/start-kiosk.sh
+      X-GNOME-Autostart-enabled=true
+      Hidden=false
+      NoDisplay=false
+      EOF'
+    # Trois emplacements : apt deb, snap, et fallback
+    - curtin in-target -- mkdir -p /etc/chromium-browser/policies/managed
+    - curtin in-target -- mkdir -p /etc/chromium/policies/managed
+    - |
+      curtin in-target -- bash -c 'cat > /etc/chromium/policies/managed/kiosk-policy.json <<EOF
+      {
+        "HomepageLocation": "https://iris.albk.fr",
+        "HomepageIsNewTabPage": false,
+        "RestoreOnStartup": 4,
+        "RestoreOnStartupURLs": ["https://iris.albk.fr"],
+        "URLBlocklist": ["chrome://*", "chrome-extension://*", "file://*", "about:*", "view-source:*"],
+        "URLAllowlist": ["https://iris.albk.fr/*", "https://iris.albk.fr"],
+        "DeveloperToolsAvailability": 2,
+        "IncognitoModeAvailability": 1,
+        "BookmarkBarEnabled": false,
+        "EditBookmarksEnabled": false,
+        "ImportBookmarks": false,
+        "ImportHistory": false,
+        "ImportSavedPasswords": false,
+        "ImportSearchEngine": false,
+        "PasswordManagerEnabled": false,
+        "AutofillAddressEnabled": false,
+        "AutofillCreditCardEnabled": false,
+        "BrowserAddPersonEnabled": false,
+        "BrowserGuestModeEnabled": false,
+        "BrowserSignin": 0,
+        "SyncDisabled": true,
+        "DownloadRestrictions": 3,
+        "DownloadDirectory": "/tmp/kiosk-downloads",
+        "PrintingEnabled": false,
+        "TranslateEnabled": false,
+        "SpellcheckEnabled": false,
+        "SearchSuggestEnabled": false,
+        "DefaultSearchProviderEnabled": false,
+        "ShowAppsShortcutInBookmarkBar": false,
+        "ShowHomeButton": false,
+        "FullscreenAllowed": true,
+        "DefaultNotificationsSetting": 2,
+        "DefaultGeolocationSetting": 2,
+        "DefaultPopupsSetting": 2,
+        "ExtensionInstallBlocklist": ["*"],
+        "DeveloperToolsDisabled": true,
+        "MetricsReportingEnabled": false,
+        "SafeBrowsingProtectionLevel": 0,
+        "PromotionalTabsEnabled": false,
+        "WelcomePageOnOSUpgradeEnabled": false,
+        "DefaultBrowserSettingEnabled": false,
+        "HideWebStoreIcon": true
+      }
+      EOF'
+    - curtin in-target -- cp /etc/chromium/policies/managed/kiosk-policy.json /etc/chromium-browser/policies/managed/kiosk-policy.json
+
+    # =========================================================================
+    # PHASE 6/7 : Script de lancement + verrouillage X11
+    # =========================================================================
+    - 'echo "===== PHASE 6/7 : Script kiosque + verrouillage clavier ====="'
+    - |
+      curtin in-target -- bash -c 'cat > /usr/local/bin/start-kiosk.sh <<"EOF"
+      #!/bin/bash
+      # =============================================================
+      # Lancement du terminal applicatif (mode kiosque verrouillé)
+      # =============================================================
+
+      # /snap/bin doit être dans PATH : XFCE autostart utilise un env minimal
+      export PATH="/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+      # Tue tout locker résiduel (light-locker, xfce4-screensaver)
+      pkill -x light-locker 2>/dev/null || true
+      pkill -x xfce4-screensaver 2>/dev/null || true
+
+      KIOSK_URL="https://iris.albk.fr"
+
+      # Détection du binaire Chromium avec attente (5 min max)
+      # snap=chromium / apt=chromium-browser
+      BROWSER=""
+      for i in $(seq 1 60); do
+        if command -v chromium >/dev/null 2>&1; then
+          BROWSER=chromium
+          break
+        elif command -v chromium-browser >/dev/null 2>&1; then
+          BROWSER=chromium-browser
+          break
+        fi
+        sleep 5
+      done
+
+      # Si Chromium toujours absent : afficher une erreur plein écran
+      # et arrêter (évite la boucle infinie de processus en échec)
+      if [ -z "$BROWSER" ]; then
+        if command -v xmessage >/dev/null 2>&1; then
+          xmessage -center -timeout 0 \
+            "ERREUR : Chromium n'\''est pas installé. Vérifier kiosk-firstboot.service via SSH."
+        fi
+        echo "[start-kiosk] ERREUR : Chromium introuvable après 5 min d'\''attente." >&2
+        exit 1
+      fi
+
+      # Désactive extinction écran / veille / DPMS
+      xset s off
+      xset -dpms
+      xset s noblank
+
+      # Cache le curseur après 1s d'\''inactivité
+      unclutter -idle 1 -root &
+
+      # Désactive les raccourcis XFCE problématiques
+      xfconf-query -c xfce4-keyboard-shortcuts -lv 2>/dev/null | \
+        awk "/<Primary>|<Alt>|<Super>/{print \$1}" | \
+        while read shortcut; do
+          xfconf-query -c xfce4-keyboard-shortcuts -p "$shortcut" -r 2>/dev/null
+        done
+
+      sleep 3
+
+      # Nettoyage du profil au démarrage (évite les bandeaux "session non propre")
+      rm -rf /home/kiosk/.config/chromium/Singleton* 2>/dev/null
+      rm -rf /home/kiosk/snap/chromium/common/chromium/Singleton* 2>/dev/null
+      sed -i '\''s/"exited_cleanly":false/"exited_cleanly":true/; s/"exit_type":"Crashed"/"exit_type":"Normal"/'\'' \
+        /home/kiosk/.config/chromium/Default/Preferences 2>/dev/null || true
+
+      # Boucle : si Chromium plante ou est tué, il redémarre
+      while true; do
+        $BROWSER \
+          --kiosk \
+          --incognito \
+          --noerrdialogs \
+          --disable-infobars \
+          --no-first-run \
+          --no-default-browser-check \
+          --disable-translate \
+          --disable-features=TranslateUI,InfiniteSessionRestore \
+          --disable-session-crashed-bubble \
+          --disable-pinch \
+          --overscroll-history-navigation=0 \
+          --check-for-update-interval=31536000 \
+          --disable-component-update \
+          --disable-background-networking \
+          --start-maximized \
+          --start-fullscreen \
+          --window-position=0,0 \
+          "$KIOSK_URL"
+        sleep 3
+      done
+      EOF'
+    - curtin in-target -- chmod +x /usr/local/bin/start-kiosk.sh
+    # NB : pas de chown ici → l'utilisateur kiosk n'est pas encore créé
+    # à ce stade (cloud-init le crée au firstboot). Le chown est déplacé
+    # dans kiosk-firstboot.sh (Phase 7) qui tourne après création.
+
+    # Désactivation du switch tty (Ctrl+Alt+Fx)
+    - curtin in-target -- mkdir -p /etc/X11/xorg.conf.d
+    - |
+      curtin in-target -- bash -c 'cat > /etc/X11/xorg.conf.d/99-kiosk-lockdown.conf <<EOF
+      Section "ServerFlags"
+          Option "DontVTSwitch" "true"
+          Option "DontZap" "true"
+      EndSection
+      EOF'
+
+    # Désactivation des raccourcis XFCE par défaut
+    - curtin in-target -- mkdir -p /home/kiosk/.config/xfce4/xfconf/xfce-perchannel-xml
+    - |
+      curtin in-target -- bash -c 'cat > /home/kiosk/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml <<EOF
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-keyboard-shortcuts" version="1.0">
+        <property name="commands" type="empty">
+          <property name="custom" type="empty">
+            <property name="override" type="bool" value="true"/>
+          </property>
+        </property>
+        <property name="xfwm4" type="empty">
+          <property name="custom" type="empty">
+            <property name="override" type="bool" value="true"/>
+          </property>
+        </property>
+      </channel>
+      EOF'
+
+    # Config xfce4-power-manager : désactive veille, DPMS, lock
+    - |
+      curtin in-target -- bash -c 'cat > /home/kiosk/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml <<EOF
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-power-manager" version="1.0">
+        <property name="xfce4-power-manager" type="empty">
+          <property name="lock-screen-suspend-hibernate" type="bool" value="false"/>
+          <property name="blank-on-ac" type="int" value="0"/>
+          <property name="blank-on-battery" type="int" value="0"/>
+          <property name="dpms-enabled" type="bool" value="false"/>
+          <property name="dpms-on-ac-sleep" type="uint" value="0"/>
+          <property name="dpms-on-ac-off" type="uint" value="0"/>
+          <property name="inactivity-on-ac" type="uint" value="0"/>
+          <property name="inactivity-on-battery" type="uint" value="0"/>
+        </property>
+      </channel>
+      EOF'
+    # chown déplacé dans kiosk-firstboot.sh (utilisateur kiosk pas encore créé)
+
+    # =========================================================================
+    # PHASE 7/7 : Service first-boot (installe Chromium snap au 1er démarrage)
+    # On installe le snap APRÈS le boot car snapd ne tourne pas dans le chroot
+    # de l'installeur. Ça évite l'échec sur "chromium-browser" (transitional).
+    # =========================================================================
+    - 'echo "===== PHASE 7/7 : Service first-boot Chromium ====="'
+    - |
+      curtin in-target -- bash -c 'cat > /etc/systemd/system/kiosk-firstboot.service <<EOF
+      [Unit]
+      Description=Installation Chromium snap (premier démarrage kiosque)
+      After=network-online.target snapd.service snapd.seeded.service
+      Wants=network-online.target snapd.seeded.service
+      Before=lightdm.service
+      ConditionPathExists=!/var/lib/kiosk-firstboot.done
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      StandardOutput=journal+console
+      TimeoutStartSec=600
+      ExecStart=/usr/local/bin/kiosk-firstboot.sh
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF'
+    - |
+      curtin in-target -- bash -c 'cat > /usr/local/bin/kiosk-firstboot.sh <<"EOF"
+      #!/bin/bash
+      # =============================================================
+      # Premier démarrage :
+      #   1. Corrige les permissions /home/kiosk (créé par cloud-init)
+      #   2. Installe Chromium en snap (snapd dispo seulement après boot)
+      # NE PAS appeler systemctl start lightdm ici → deadlock garanti
+      # car lightdm a After=kiosk-firstboot (via Before=lightdm).
+      # graphical.target déclenche lightdm dès que ce script termine.
+      # =============================================================
+      set -e
+
+      # Attente que cloud-init ait fini de créer l'\''utilisateur kiosk
+      for i in $(seq 1 30); do
+        id kiosk >/dev/null 2>&1 && break
+        sleep 2
+      done
+
+      echo "[kiosk-firstboot] Correction des permissions /home/kiosk..."
+      if id kiosk >/dev/null 2>&1; then
+        chown -R kiosk:kiosk /home/kiosk
+      fi
+
+      echo "[kiosk-firstboot] Attente de snapd..."
+      snap wait system seed.loaded
+
+      echo "[kiosk-firstboot] Installation de Chromium (snap, ~150 MB)..."
+      snap install chromium
+
+      echo "[kiosk-firstboot] Copie des policies Chromium..."
+      mkdir -p /var/snap/chromium/current/policies/managed
+      cp /etc/chromium/policies/managed/kiosk-policy.json \
+         /var/snap/chromium/current/policies/managed/ 2>/dev/null || true
+
+      touch /var/lib/kiosk-firstboot.done
+      echo "[kiosk-firstboot] Terminé. graphical.target va démarrer lightdm."
+      EOF'
+    - curtin in-target -- chmod +x /usr/local/bin/kiosk-firstboot.sh
+    - curtin in-target -- systemctl enable kiosk-firstboot.service
+
+    # ---------- Mises à jour automatiques sécurité ----------
+    - |
+      curtin in-target -- bash -c 'cat >> /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+      EOF'
+    - |
+      curtin in-target -- bash -c 'cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+      EOF'
+
+    - echo "===== INSTALLATION TERMINÉE ====="
