@@ -216,7 +216,7 @@ autoinstall:
     # =========================================================================
     - 'echo "===== PHASE 6/7 : Script kiosque + verrouillage clavier ====="'
     - |
-      curtin in-target -- bash -c 'cat > /usr/local/bin/start-kiosk.sh <<"EOF"
+      cat > /target/usr/local/bin/start-kiosk.sh << 'KIOSK_EOF'
       #!/bin/bash
       # =============================================================
       # Lancement du terminal applicatif (mode kiosque verrouillé)
@@ -228,6 +228,21 @@ autoinstall:
       # Tue tout locker résiduel (light-locker, xfce4-screensaver)
       pkill -x light-locker 2>/dev/null || true
       pkill -x xfce4-screensaver 2>/dev/null || true
+
+      # Fond noir immédiat sur root window
+      xsetroot -solid black 2>/dev/null || true
+
+      # Pas d'icones - fond noir sur moniteurs via xrandr
+      xfconf-query -c xfce4-desktop -p /desktop-icons/style -s 0 --create -t int 2>/dev/null || true
+      xrandr --listmonitors 2>/dev/null | awk "NR>1{print \$NF}" | while read mon; do
+        for ws in 0 1 2 3; do
+          base="/backdrop/screen0/$mon/workspace$ws"
+          xfconf-query -c xfce4-desktop -p "$base/color-style" -s 0 --create -t int 2>/dev/null || true
+          xfconf-query -c xfce4-desktop -p "$base/image-style" -s 0 --create -t int 2>/dev/null || true
+          xfconf-query -c xfce4-desktop -p "$base/rgba1" -s 0.0 -s 0.0 -s 0.0 -s 1.0 --create -t double -t double -t double -t double 2>/dev/null || true
+        done
+      done
+      xfdesktop --reload 2>/dev/null || true
 
       KIOSK_URL="https://iris.albk.fr"
 
@@ -250,9 +265,9 @@ autoinstall:
       if [ -z "$BROWSER" ]; then
         if command -v xmessage >/dev/null 2>&1; then
           xmessage -center -timeout 0 \
-            "ERREUR : Chromium n'\''est pas installé. Vérifier kiosk-firstboot.service via SSH."
+            "ERREUR : Chromium n'est pas installé. Vérifier kiosk-firstboot.service via SSH."
         fi
-        echo "[start-kiosk] ERREUR : Chromium introuvable après 5 min d'\''attente." >&2
+        echo "[start-kiosk] ERREUR : Chromium introuvable après 5 min d'attente." >&2
         exit 1
       fi
 
@@ -261,7 +276,7 @@ autoinstall:
       xset -dpms
       xset s noblank
 
-      # Cache le curseur après 1s d'\''inactivité
+      # Cache le curseur après 1s d'inactivité
       unclutter -idle 1 -root &
 
       # Désactive les raccourcis XFCE problématiques
@@ -276,7 +291,7 @@ autoinstall:
       # Nettoyage du profil au démarrage (évite les bandeaux "session non propre")
       rm -rf /home/kiosk/.config/chromium/Singleton* 2>/dev/null
       rm -rf /home/kiosk/snap/chromium/common/chromium/Singleton* 2>/dev/null
-      sed -i '\''s/"exited_cleanly":false/"exited_cleanly":true/; s/"exit_type":"Crashed"/"exit_type":"Normal"/'\'' \
+      sed -i 's/"exited_cleanly":false/"exited_cleanly":true/; s/"exit_type":"Crashed"/"exit_type":"Normal"/' \
         /home/kiosk/.config/chromium/Default/Preferences 2>/dev/null || true
 
       # Boucle : si Chromium plante ou est tué, il redémarre
@@ -302,8 +317,8 @@ autoinstall:
           "$KIOSK_URL"
         sleep 3
       done
-      EOF'
-    - curtin in-target -- chmod +x /usr/local/bin/start-kiosk.sh
+      KIOSK_EOF
+      chmod +x /target/usr/local/bin/start-kiosk.sh
     # NB : pas de chown ici → l'utilisateur kiosk n'est pas encore créé
     # à ce stade (cloud-init le crée au firstboot). Le chown est déplacé
     # dans kiosk-firstboot.sh (Phase 7) qui tourne après création.
@@ -351,6 +366,34 @@ autoinstall:
           <property name="dpms-on-ac-off" type="uint" value="0"/>
           <property name="inactivity-on-ac" type="uint" value="0"/>
           <property name="inactivity-on-battery" type="uint" value="0"/>
+        </property>
+      </channel>
+      EOF'
+    # Config xfce4-desktop : fond noir + pas d'icônes
+    - |
+      curtin in-target -- bash -c 'cat > /home/kiosk/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<EOF
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-desktop" version="1.0">
+        <property name="desktop-icons" type="empty">
+          <property name="style" type="int" value="0"/>
+          <property name="show-hidden-files" type="bool" value="false"/>
+          <property name="show-thumbnails" type="bool" value="false"/>
+        </property>
+        <property name="backdrop" type="empty">
+          <property name="screen0" type="empty">
+            <property name="monitor0" type="empty">
+              <property name="workspace0" type="empty">
+                <property name="color-style" type="int" value="0"/>
+                <property name="image-style" type="int" value="0"/>
+                <property name="rgba1" type="array">
+                  <value type="double" value="0.000000"/>
+                  <value type="double" value="0.000000"/>
+                  <value type="double" value="0.000000"/>
+                  <value type="double" value="1.000000"/>
+                </property>
+              </property>
+            </property>
+          </property>
         </property>
       </channel>
       EOF'
